@@ -1,4 +1,5 @@
 import os
+import asyncio
 import threading
 from flask import Flask
 from telegram import Update
@@ -34,6 +35,9 @@ def main():
 
     # Flask в фоне
     threading.Thread(target=run_flask, daemon=True).start()
+
+    # Event loop для новых версий Python
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
     # Бот в главном потоке
     application = ApplicationBuilder().token(BOT_TOKEN).build()
