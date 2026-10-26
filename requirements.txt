@@ -1,2 +1,3 @@
-   flask
-   python-telegram-bot==21.6
+flask
+python-telegram-bot==21.6
+requests
