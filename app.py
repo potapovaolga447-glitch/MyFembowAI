@@ -3,6 +3,7 @@ import io
 import random
 import asyncio
 import threading
+from functools import wraps
 from urllib.parse import quote
 
 import requests
@@ -13,6 +14,18 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+
+# Белый список: ID пользователей через запятую, например "123456789,987654321"
+# Если переменная пустая или не задана, бот доступен всем.
+def parse_allowed_ids(raw: str):
+    ids = set()
+    for part in (raw or "").replace(";", ",").split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.add(int(part))
+    return ids
+
+ALLOWED_IDS = parse_allowed_ids(os.environ.get("ALLOWED_USER_IDS", ""))
 
 LABEL_TEXT = "Фембой AI"
 LABEL_COLOR = (255, 105, 180)   # розовый
@@ -35,6 +48,23 @@ def health():
 def run_flask():
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
+
+# ---------- Белый список ----------
+
+def allowed_only(func):
+    """Пускает к команде только пользователей из белого списка."""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.message is None or update.effective_user is None:
+            return
+        user_id = update.effective_user.id
+        if ALLOWED_IDS and user_id not in ALLOWED_IDS:
+            await update.message.reply_text(
+                f"У тебя нет доступа к этому боту.\nТвой ID: {user_id}"
+            )
+            return
+        await func(update, context)
+    return wrapper
 
 # ---------- Шрифт ----------
 
@@ -98,6 +128,13 @@ def make_image(prompt: str):
 
 # ---------- Команды бота ----------
 
+async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает ID пользователя. Доступна всем, чтобы можно было узнать свой ID."""
+    if update.message is None or update.effective_user is None:
+        return
+    await update.message.reply_text(f"Твой ID: {update.effective_user.id}")
+
+@allowed_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я рисую картинки по описанию.\n\n"
@@ -123,9 +160,11 @@ async def generate(update: Update, prompt: str):
             "Не получилось создать картинку. Сервис мог быть занят, попробуй через минуту."
         )
 
+@allowed_only
 async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await generate(update, " ".join(context.args))
 
+@allowed_only
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await generate(update, update.message.text)
 
@@ -138,6 +177,7 @@ def main():
 
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("id", my_id))
     application.add_handler(CommandHandler("image", image_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     application.run_polling()
