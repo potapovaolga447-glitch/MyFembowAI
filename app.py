@@ -1,14 +1,22 @@
 import os
+import io
+import random
 import asyncio
 import threading
 from urllib.parse import quote
 
 import requests
+from PIL import Image, ImageDraw, ImageFont
+from deep_translator import GoogleTranslator
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+
+LABEL_TEXT = "Фембой AI"
+LABEL_COLOR = (255, 105, 180)   # розовый
+OUTLINE_COLOR = (60, 0, 40)     # тёмная обводка, чтобы текст читался на любом фоне
 
 # Flask нужен, чтобы Render видел открытый порт
 app = Flask(__name__)
@@ -25,17 +33,63 @@ def run_flask():
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
 
+# ---------- Шрифт ----------
+
+def load_font(size: int):
+    """Ищет шрифт с поддержкой кириллицы."""
+    candidates = []
+    try:
+        import matplotlib
+        candidates.append(os.path.join(matplotlib.get_data_path(), "fonts", "ttf", "DejaVuSans-Bold.ttf"))
+    except Exception:
+        pass
+    candidates.append("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
+    for path in candidates:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
+    return ImageFont.load_default()
+
 # ---------- Генерация изображения ----------
 
-def fetch_image(prompt: str):
-    """Скачивает картинку с Pollinations. Возвращает байты или None."""
-    url = f"https://image.pollinations.ai/prompt/{quote(prompt)}"
-    params = {"width": 1024, "height": 1024, "model": "flux", "nologo": "true"}
+def translate_to_english(text: str) -> str:
+    try:
+        return GoogleTranslator(source="auto", target="en").translate(text) or text
+    except Exception:
+        return text
+
+def add_label(image_bytes: bytes) -> bytes:
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    font = load_font(max(24, img.width // 14))
+    margin = img.width // 40
+    draw.text(
+        (margin, margin),
+        LABEL_TEXT,
+        font=font,
+        fill=LABEL_COLOR,
+        stroke_width=max(2, img.width // 300),
+        stroke_fill=OUTLINE_COLOR,
+    )
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=92)
+    return out.getvalue()
+
+def make_image(prompt: str):
+    """Переводит описание, скачивает картинку, добавляет надпись."""
+    english = translate_to_english(prompt)
+    url = f"https://image.pollinations.ai/prompt/{quote(english)}"
+    params = {
+        "width": 1024,
+        "height": 1024,
+        "model": "flux",
+        "nologo": "true",
+        "seed": random.randint(1, 10_000_000),
+    }
     try:
         r = requests.get(url, params=params, timeout=90)
         if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
-            return r.content
-    except requests.RequestException:
+            return add_label(r.content)
+    except Exception:
         pass
     return None
 
@@ -57,8 +111,7 @@ async def generate(update: Update, prompt: str):
     await update.message.reply_text("Рисую, подожди 10-30 секунд...")
     await update.message.chat.send_action("upload_photo")
 
-    # requests работает синхронно, поэтому запускаем в отдельном потоке
-    image = await asyncio.to_thread(fetch_image, prompt)
+    image = await asyncio.to_thread(make_image, prompt)
 
     if image:
         await update.message.reply_photo(photo=image, caption=prompt[:200])
@@ -77,10 +130,7 @@ def main():
     if not BOT_TOKEN:
         raise RuntimeError("Переменная BOT_TOKEN не задана в Environment на Render")
 
-    # Flask в фоне
     threading.Thread(target=run_flask, daemon=True).start()
-
-    # Event loop для новых версий Python
     asyncio.set_event_loop(asyncio.new_event_loop())
 
     application = ApplicationBuilder().token(BOT_TOKEN).build()
