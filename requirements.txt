@@ -1,3 +1,6 @@
 flask
 python-telegram-bot==21.6
 requests
+pillow
+deep-translator
+matplotlib
