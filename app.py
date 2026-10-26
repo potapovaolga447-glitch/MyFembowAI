@@ -18,6 +18,9 @@ LABEL_TEXT = "Фембой AI"
 LABEL_COLOR = (255, 105, 180)   # розовый
 OUTLINE_COLOR = (60, 0, 40)     # тёмная обводка, чтобы текст читался на любом фоне
 
+# Слова, которые бот сам добавляет к каждому запросу для лучшего качества
+QUALITY_SUFFIX = ", highly detailed, high quality, sharp focus, professional, 4k, beautiful lighting, well-formed anatomy"
+
 # Flask нужен, чтобы Render видел открытый порт
 app = Flask(__name__)
 
@@ -75,8 +78,8 @@ def add_label(image_bytes: bytes) -> bytes:
     return out.getvalue()
 
 def make_image(prompt: str):
-    """Переводит описание, скачивает картинку, добавляет надпись."""
-    english = translate_to_english(prompt)
+    """Переводит описание, добавляет качество, скачивает картинку, ставит надпись."""
+    english = translate_to_english(prompt) + QUALITY_SUFFIX
     url = f"https://image.pollinations.ai/prompt/{quote(english)}"
     params = {
         "width": 1024,
