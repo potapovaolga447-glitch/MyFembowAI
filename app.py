@@ -30,6 +30,7 @@ ALLOWED_IDS = parse_allowed_ids(os.environ.get("ALLOWED_USER_IDS", ""))
 LABEL_TEXT = "Фембой AI"
 LABEL_COLOR = (255, 105, 180)   # розовый
 OUTLINE_COLOR = (60, 0, 40)     # тёмная обводка, чтобы текст читался на любом фоне
+LABEL_SCALE = 0.5               # размер надписи: 1.0 = прежний, 0.5 = вдвое меньше
 
 # Слова, которые бот сам добавляет к каждому запросу для лучшего качества
 QUALITY_SUFFIX = ", highly detailed, high quality, sharp focus, professional, 4k, beautiful lighting, well-formed anatomy"
@@ -93,14 +94,25 @@ def translate_to_english(text: str) -> str:
 def add_label(image_bytes: bytes) -> bytes:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     draw = ImageDraw.Draw(img)
-    font = load_font(max(24, img.width // 14))
-    margin = img.width // 40
+
+    font_size = max(14, int(img.width / 14 * LABEL_SCALE))
+    font = load_font(font_size)
+    stroke = max(1, round(img.width / 300 * LABEL_SCALE))
+    margin = max(8, int(img.width / 40 * LABEL_SCALE * 2))
+
+    # Размер текста, чтобы поставить его точно в правый нижний угол
+    left, top, right, bottom = draw.textbbox((0, 0), LABEL_TEXT, font=font, stroke_width=stroke)
+    text_w = right - left
+    text_h = bottom - top
+    x = img.width - text_w - margin - left
+    y = img.height - text_h - margin - top
+
     draw.text(
-        (margin, margin),
+        (x, y),
         LABEL_TEXT,
         font=font,
         fill=LABEL_COLOR,
-        stroke_width=max(2, img.width // 300),
+        stroke_width=stroke,
         stroke_fill=OUTLINE_COLOR,
     )
     out = io.BytesIO()
