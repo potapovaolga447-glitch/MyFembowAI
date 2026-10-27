@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import random
 import asyncio
 import logging
@@ -32,9 +33,21 @@ def parse_list(raw, default):
     items = [x.strip() for x in (raw or "").split(",") if x.strip()]
     return items or default
 
-# Модели пробуются по очереди: если первая не сработала, берётся следующая
-IMAGE_MODELS = parse_list(os.environ.get("IMAGE_MODELS"), ["zimage", "flux"])
-VIDEO_MODELS = parse_list(os.environ.get("VIDEO_MODELS"), ["wan-fast", "ltx-2"])
+# Модели пробуются по очереди: если первая не сработала, берётся следующая.
+# Названия взяты из команды /models. Поменять можно в Render -> Environment
+# (переменные IMAGE_MODELS и VIDEO_MODELS, через запятую).
+IMAGE_MODELS = parse_list(os.environ.get("IMAGE_MODELS"), [
+    "tongyi-mai/z-image-turbo",
+    "black-forest-labs/flux.1-schnell",
+    "prunaai/p-image",
+    "zimage",
+])
+VIDEO_MODELS = parse_list(os.environ.get("VIDEO_MODELS"), [
+    "alibaba/wan-2.2-fast",
+    "prunaai/p-video",
+    "bytedance/seedance-2.0-mini",
+    "wan-fast",
+])
 VIDEO_SECONDS = 5
 
 # Белый список: ID через запятую. Если пусто, бот доступен всем.
@@ -147,8 +160,27 @@ def translate_to_english(text: str) -> str:
     except Exception:
         return text
 
+def short_error(status: int, body: str) -> str:
+    """Достаёт из ответа сервиса короткую понятную причину ошибки."""
+    msg = ""
+    try:
+        data = json.loads(body)
+        if isinstance(data, dict):
+            err = data.get("error", data)
+            if isinstance(err, dict):
+                msg = err.get("message") or ""
+            elif isinstance(err, str):
+                msg = err
+            if not msg:
+                msg = data.get("message") or ""
+    except Exception:
+        pass
+    if not msg:
+        msg = (body or "").strip()[:120]
+    return f"HTTP {status}: {str(msg)[:140]}"
+
 def http_get_media(url, params, expected_type, timeout, label):
-    """Скачивает файл. Возвращает байты или None (причина пишется в логи Render)."""
+    """Скачивает файл. Возвращает (байты, '') или (None, причина ошибки)."""
     headers = {}
     if POLLINATIONS_KEY and url.startswith(API_BASE):
         headers["Authorization"] = f"Bearer {POLLINATIONS_KEY}"
@@ -156,48 +188,62 @@ def http_get_media(url, params, expected_type, timeout, label):
         r = requests.get(url, params=params, headers=headers, timeout=timeout)
     except requests.RequestException as e:
         log.warning("%s: ошибка запроса: %s", label, e)
-        return None
+        return None, f"ошибка сети ({type(e).__name__})"
     ctype = r.headers.get("content-type", "")
     if r.status_code == 200 and ctype.startswith(expected_type):
-        return r.content
+        return r.content, ""
     log.warning("%s: HTTP %s, тип %s, ответ: %s", label, r.status_code, ctype, r.text[:300])
-    return None
+    return None, short_error(r.status_code, r.text)
 
 def make_image(prompt: str):
+    """Возвращает (картинка или None, список ошибок по моделям)."""
     english = translate_to_english(prompt) + QUALITY_SUFFIX
     seed = random.randint(1, 10_000_000)
     data = None
+    errors = []
 
     if POLLINATIONS_KEY:
         url = f"{API_BASE}/image/{quote(english, safe='')}"
         for model in IMAGE_MODELS:
             params = {"model": model, "width": 1024, "height": 1024, "seed": seed}
-            data = http_get_media(url, params, "image", 120, f"фото:{model}")
+            data, err = http_get_media(url, params, "image", 90, f"фото:{model}")
             if data:
                 break
+            errors.append(f"{model}: {err}")
     else:
         # Запасной вариант без ключа: старый бесплатный сервис (одна слабая модель)
         url = f"https://image.pollinations.ai/prompt/{quote(english, safe='')}"
         params = {"model": "flux", "width": 1024, "height": 1024, "nologo": "true", "seed": seed}
-        data = http_get_media(url, params, "image", 90, "фото:legacy")
+        data, err = http_get_media(url, params, "image", 90, "фото:legacy")
+        if not data:
+            errors.append(f"legacy: {err}")
 
     if not data:
-        return None
+        return None, errors
     try:
-        return add_label(data)
+        return add_label(data), []
     except Exception:
         log.exception("Не удалось добавить надпись")
-        return data
+        return data, []
 
 def make_video(prompt: str):
+    """Возвращает (видео или None, список ошибок по моделям)."""
     english = translate_to_english(prompt) + VIDEO_SUFFIX
     url = f"{API_BASE}/video/{quote(english, safe='')}"
+    errors = []
     for model in VIDEO_MODELS:
         params = {"model": model, "duration": VIDEO_SECONDS}
-        data = http_get_media(url, params, "video", 300, f"видео:{model}")
+        data, err = http_get_media(url, params, "video", 240, f"видео:{model}")
         if data:
-            return data
-    return None
+            return data, []
+        errors.append(f"{model}: {err}")
+    return None, errors
+
+def format_errors(errors) -> str:
+    if not errors:
+        return "Подробностей нет, смотри логи в Render."
+    lines = [f"— {e}" for e in errors[:6]]
+    return ("Что ответил сервис:\n" + "\n".join(lines))[:3500]
 
 def fetch_models_text() -> str:
     lines = [
@@ -227,7 +273,7 @@ def fetch_models_text() -> str:
         lines.append(f"Не удалось получить список моделей: {e}")
     lines.append("")
     lines.append("Поменять модели можно в Render → Environment: IMAGE_MODELS и VIDEO_MODELS (через запятую).")
-    return "\n".join(lines)
+    return "\n".join(lines)[:3900]
 
 # ---------- Общая логика генерации ----------
 
@@ -251,7 +297,7 @@ async def do_generate(bot, chat_id: int, user_id: int, kind: str, prompt: str):
         if kind == "video":
             status = await bot.send_message(chat_id, "Делаю видео, это займёт 1-3 минуты...")
             await bot.send_chat_action(chat_id, "upload_video")
-            video = await asyncio.to_thread(make_video, prompt)
+            video, errors = await asyncio.to_thread(make_video, prompt)
             if video:
                 await bot.send_video(
                     chat_id,
@@ -262,22 +308,15 @@ async def do_generate(bot, chat_id: int, user_id: int, kind: str, prompt: str):
                     write_timeout=120,
                 )
             else:
-                await bot.send_message(
-                    chat_id,
-                    "Не получилось сделать видео. Модель могла быть занята или недоступна на твоём ключе. "
-                    "Попробуй позже или проверь /models.",
-                )
+                await bot.send_message(chat_id, "Не получилось сделать видео.\n\n" + format_errors(errors))
         else:
             status = await bot.send_message(chat_id, "Рисую, подожди 10-30 секунд...")
             await bot.send_chat_action(chat_id, "upload_photo")
-            image = await asyncio.to_thread(make_image, prompt)
+            image, errors = await asyncio.to_thread(make_image, prompt)
             if image:
                 await bot.send_photo(chat_id, photo=image, caption=prompt[:200])
             else:
-                await bot.send_message(
-                    chat_id,
-                    "Не получилось создать картинку. Сервис мог быть занят, попробуй через минуту.",
-                )
+                await bot.send_message(chat_id, "Не получилось создать картинку.\n\n" + format_errors(errors))
     except Exception:
         log.exception("Ошибка при генерации")
         await bot.send_message(chat_id, "Что-то пошло не так, попробуй ещё раз.")
