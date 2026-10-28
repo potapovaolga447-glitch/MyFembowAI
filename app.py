@@ -1,5 +1,6 @@
 import os
 import io
+import sys
 import json
 import time
 import random
@@ -34,6 +35,17 @@ API_BASE = "https://gen.pollinations.ai"
 def parse_list(raw, default):
     items = [x.strip() for x in (raw or "").split(",") if x.strip()]
     return items or default
+
+def int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+# Автоперезапуск: раз в сколько минут перезапускать бота (0 = выключить)
+RESTART_EVERY_MIN = int_env("RESTART_EVERY_MIN", 20)
+# Самопроверка, чтобы бесплатный Render не засыпал: раз в сколько минут (0 = выключить)
+KEEP_ALIVE_MIN = int_env("KEEP_ALIVE_MIN", 10)
 
 # Модели для фото по описанию (пробуются по очереди). Названия из команды /models.
 IMAGE_MODELS = parse_list(os.environ.get("IMAGE_MODELS"), [
@@ -127,6 +139,35 @@ def temp_image(token):
 def run_flask():
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
+
+# ---------- Самопроверка и автоперезапуск ----------
+
+def keep_alive_loop():
+    """Сам стучится в свой адрес, чтобы бесплатный Render не засыпал."""
+    while True:
+        time.sleep(KEEP_ALIVE_MIN * 60)
+        base = public_base_url()
+        if not base:
+            continue
+        try:
+            requests.get(f"{base}/health", timeout=20)
+        except requests.RequestException as e:
+            log.warning("Самопроверка не удалась: %s", e)
+
+def restart_loop():
+    """Раз в N минут перезапускает бота, но только когда никто не ждёт результат."""
+    while True:
+        time.sleep(RESTART_EVERY_MIN * 60)
+        waited = 0
+        while BUSY_USERS and waited < 600:
+            time.sleep(5)
+            waited += 5
+        if BUSY_USERS:
+            log.info("Плановый перезапуск отложен: бот занят")
+            continue
+        log.info("Плановый перезапуск бота")
+        logging.shutdown()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 # ---------- Белый список ----------
 
@@ -371,12 +412,16 @@ def format_errors(errors) -> str:
     return ("Что пошло не так:\n" + "\n".join(lines))[:3500]
 
 def fetch_models_text() -> str:
+    restart = f"каждые {RESTART_EVERY_MIN} мин" if RESTART_EVERY_MIN > 0 else "выключен"
+    ping = f"каждые {KEEP_ALIVE_MIN} мин" if KEEP_ALIVE_MIN > 0 else "выключена"
     lines = [
         f"Фото по описанию: {' → '.join(IMAGE_MODELS)}",
         f"Изменение фото: {' → '.join(EDIT_MODELS)}",
         f"Видео: {' → '.join(VIDEO_MODELS)}",
         f"Ключ Pollinations: {'есть' if POLLINATIONS_KEY else 'НЕ задан'}",
         f"Адрес сервиса: {public_base_url() or 'не найден (нужна переменная PUBLIC_URL)'}",
+        f"Автоперезапуск: {restart}",
+        f"Самопроверка: {ping}",
         "",
     ]
     try:
@@ -652,6 +697,10 @@ def main():
         raise RuntimeError("Переменная BOT_TOKEN не задана в Environment на Render")
 
     threading.Thread(target=run_flask, daemon=True).start()
+    if KEEP_ALIVE_MIN > 0:
+        threading.Thread(target=keep_alive_loop, daemon=True).start()
+    if RESTART_EVERY_MIN > 0:
+        threading.Thread(target=restart_loop, daemon=True).start()
     asyncio.set_event_loop(asyncio.new_event_loop())
 
     # concurrent_updates: пока одному человеку делается видео, бот отвечает остальным
