@@ -8,6 +8,7 @@ import asyncio
 import logging
 import secrets
 import threading
+from datetime import datetime, timezone
 from functools import wraps, lru_cache
 from urllib.parse import quote
 
@@ -46,6 +47,8 @@ def int_env(name: str, default: int) -> int:
 RESTART_EVERY_MIN = int_env("RESTART_EVERY_MIN", 20)
 # Самопроверка, чтобы бесплатный Render не засыпал: раз в сколько минут (0 = выключить)
 KEEP_ALIVE_MIN = int_env("KEEP_ALIVE_MIN", 10)
+# Лимит генераций в день для всех (0 = без лимита). Личный лимит админа главнее.
+DEFAULT_DAILY_LIMIT = int_env("DEFAULT_DAILY_LIMIT", 0)
 
 # Модели для фото по описанию (пробуются по очереди). Названия из команды /models.
 IMAGE_MODELS = parse_list(os.environ.get("IMAGE_MODELS"), [
@@ -80,9 +83,11 @@ def parse_allowed_ids(raw: str):
     return ids
 
 ALLOWED_IDS = parse_allowed_ids(os.environ.get("ALLOWED_USER_IDS", ""))
+# Админы: ID через запятую. Они обходят белый список и лимиты, управляют лимитами.
+ADMIN_IDS = parse_allowed_ids(os.environ.get("ADMIN_IDS", ""))
 
 def is_allowed(user_id: int) -> bool:
-    return not ALLOWED_IDS or user_id in ALLOWED_IDS
+    return user_id in ADMIN_IDS or not ALLOWED_IDS or user_id in ALLOWED_IDS
 
 LABEL_TEXT = "Фембой AI"
 LABEL_COLOR = (255, 105, 180)   # розовый
@@ -96,6 +101,87 @@ DEFAULT_PHOTO_VIDEO_PROMPT = "bring this photo to life with natural subtle motio
 
 MAX_PROMPT_LEN = 500
 BUSY_USERS = set()  # кто сейчас ждёт результат (по одному запросу за раз)
+
+# ---------- Лимиты и паузы (хранятся в файле, переживают самоперезапуск) ----------
+
+STATE_FILE = os.environ.get("STATE_FILE", "/tmp/bot_state.json")
+STATE_LOCK = threading.Lock()
+STATE = {"limits": {}, "pauses": {}, "usage": {}}
+
+def load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for key in STATE:
+            STATE[key] = data.get(key, {})
+    except FileNotFoundError:
+        pass
+    except Exception:
+        log.exception("Не удалось прочитать файл с лимитами")
+
+def save_state():
+    """Сохраняет состояние. Вызывать, когда STATE_LOCK уже взят."""
+    try:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(STATE, f)
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        log.exception("Не удалось сохранить файл с лимитами")
+
+def today_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
+
+def user_limit(user_id: int):
+    """Лимит в день для человека или None, если лимита нет."""
+    with STATE_LOCK:
+        value = STATE["limits"].get(str(user_id))
+    if value is not None:
+        return int(value)
+    return DEFAULT_DAILY_LIMIT if DEFAULT_DAILY_LIMIT > 0 else None
+
+def used_today(user_id: int) -> int:
+    with STATE_LOCK:
+        info = STATE["usage"].get(str(user_id))
+    if info and info.get("date") == today_str():
+        return int(info.get("count", 0))
+    return 0
+
+def pause_left_seconds(user_id: int) -> int:
+    with STATE_LOCK:
+        until = float(STATE["pauses"].get(str(user_id), 0))
+    return max(0, int(until - time.time()))
+
+def minutes_text(seconds: int) -> str:
+    return f"{max(1, (seconds + 59) // 60)} мин."
+
+def check_access(user_id: int):
+    """Можно ли человеку генерировать сейчас. Возвращает (можно, текст отказа)."""
+    if user_id in ADMIN_IDS:
+        return True, ""
+    left = pause_left_seconds(user_id)
+    if left > 0:
+        return False, f"Тебе временно нельзя генерировать. Осталось примерно {minutes_text(left)}"
+    limit = user_limit(user_id)
+    if limit is not None and used_today(user_id) >= limit:
+        return False, f"Дневной лимит исчерпан ({limit}). Он обновится завтра."
+    return True, ""
+
+def record_use(user_id: int):
+    """Считает успешную генерацию в дневном лимите."""
+    if user_id in ADMIN_IDS:
+        return
+    day = today_str()
+    with STATE_LOCK:
+        key = str(user_id)
+        info = STATE["usage"].get(key)
+        if not info or info.get("date") != day:
+            info = {"date": day, "count": 0}
+        info["count"] += 1
+        STATE["usage"][key] = info
+        for old in [k for k, v in STATE["usage"].items() if v.get("date") != day]:
+            STATE["usage"].pop(old, None)
+        save_state()
 
 # ---------- Временные картинки для работы с твоим фото ----------
 # Чтобы ИИ мог получить твоё фото, бот на несколько минут выкладывает его
@@ -169,7 +255,7 @@ def restart_loop():
         logging.shutdown()
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
-# ---------- Белый список ----------
+# ---------- Белый список и админы ----------
 
 def allowed_only(func):
     """Пускает к команде только пользователей из белого списка."""
@@ -182,6 +268,18 @@ def allowed_only(func):
             await update.message.reply_text(
                 f"У тебя нет доступа к этому боту.\nТвой ID: {user_id}"
             )
+            return
+        await func(update, context)
+    return wrapper
+
+def admin_only(func):
+    """Пускает к команде только админов."""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.message is None or update.effective_user is None:
+            return
+        if update.effective_user.id not in ADMIN_IDS:
+            await update.message.reply_text("Эта команда только для администраторов.")
             return
         await func(update, context)
     return wrapper
@@ -414,6 +512,7 @@ def format_errors(errors) -> str:
 def fetch_models_text() -> str:
     restart = f"каждые {RESTART_EVERY_MIN} мин" if RESTART_EVERY_MIN > 0 else "выключен"
     ping = f"каждые {KEEP_ALIVE_MIN} мин" if KEEP_ALIVE_MIN > 0 else "выключена"
+    default_limit = f"{DEFAULT_DAILY_LIMIT} в день" if DEFAULT_DAILY_LIMIT > 0 else "нет"
     lines = [
         f"Фото по описанию: {' → '.join(IMAGE_MODELS)}",
         f"Изменение фото: {' → '.join(EDIT_MODELS)}",
@@ -422,6 +521,7 @@ def fetch_models_text() -> str:
         f"Адрес сервиса: {public_base_url() or 'не найден (нужна переменная PUBLIC_URL)'}",
         f"Автоперезапуск: {restart}",
         f"Самопроверка: {ping}",
+        f"Админов: {len(ADMIN_IDS)}, общий лимит: {default_limit}",
         "",
     ]
     try:
@@ -453,12 +553,18 @@ async def do_generate(bot, chat_id: int, user_id: int, kind: str, prompt: str = 
     """kind: photo (по описанию), video (по описанию), edit (правка фото), photovideo (видео из фото)."""
     prompt = prompt.strip()[:MAX_PROMPT_LEN]
 
+    allowed, deny_text = check_access(user_id)
+    if not allowed:
+        await bot.send_message(chat_id, deny_text)
+        return
+
     if user_id in BUSY_USERS:
         await bot.send_message(chat_id, "Подожди, предыдущий запрос ещё делается.")
         return
 
     BUSY_USERS.add(user_id)
     status = None
+    success = False
     try:
         photo_bytes = None
         if kind in ("edit", "photovideo"):
@@ -481,6 +587,7 @@ async def do_generate(bot, chat_id: int, user_id: int, kind: str, prompt: str = 
                     read_timeout=120,
                     write_timeout=120,
                 )
+                success = True
             else:
                 await bot.send_message(
                     chat_id,
@@ -494,6 +601,7 @@ async def do_generate(bot, chat_id: int, user_id: int, kind: str, prompt: str = 
             image, errors = await asyncio.to_thread(make_edit, prompt, photo_bytes)
             if image:
                 await bot.send_photo(chat_id, photo=image, caption=prompt[:200])
+                success = True
             else:
                 await bot.send_message(
                     chat_id,
@@ -507,6 +615,7 @@ async def do_generate(bot, chat_id: int, user_id: int, kind: str, prompt: str = 
             image, errors = await asyncio.to_thread(make_image, prompt)
             if image:
                 await bot.send_photo(chat_id, photo=image, caption=prompt[:200])
+                success = True
             else:
                 await bot.send_message(chat_id, "Не получилось создать картинку.\n\n" + format_errors(errors))
     except Exception:
@@ -514,6 +623,8 @@ async def do_generate(bot, chat_id: int, user_id: int, kind: str, prompt: str = 
         await bot.send_message(chat_id, "Что-то пошло не так, попробуй ещё раз.")
     finally:
         BUSY_USERS.discard(user_id)
+        if success:
+            record_use(user_id)
         if status is not None:
             try:
                 await status.delete()
@@ -535,7 +646,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/picture кот в космосе — фото\n"
         "/video кот бежит по лесу — видео\n\n"
         "Можно просто написать описание, и я спрошу, что создать.\n"
-        "Или пришли мне своё фото: я изменю его по описанию или сделаю из него видео."
+        "Или пришли мне своё фото: я изменю его по описанию или сделаю из него видео.\n\n"
+        "/mylimit — сколько генераций осталось"
     )
 
 @allowed_only
@@ -558,6 +670,122 @@ async def video_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = await asyncio.to_thread(fetch_models_text)
     await update.message.reply_text(text)
+
+@allowed_only
+async def mylimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id in ADMIN_IDS:
+        await update.message.reply_text("Ты администратор: без лимитов и пауз.")
+        return
+    lines = []
+    left = pause_left_seconds(user_id)
+    if left > 0:
+        lines.append(f"Пауза: генерировать нельзя ещё примерно {minutes_text(left)}")
+    limit = user_limit(user_id)
+    used = used_today(user_id)
+    if limit is None:
+        lines.append(f"Сегодня сделано: {used}. Лимита нет.")
+    else:
+        lines.append(f"Сегодня сделано: {used} из {limit}.")
+    await update.message.reply_text("\n".join(lines))
+
+# ---------- Команды админов ----------
+
+@admin_only
+async def limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/limit ID число — личный лимит генераций в день."""
+    try:
+        target = int(context.args[0])
+        amount = int(context.args[1])
+        if amount < 0:
+            raise ValueError
+    except (IndexError, ValueError):
+        await update.message.reply_text("Формат: /limit ID число\nНапример: /limit 123456789 5")
+        return
+    with STATE_LOCK:
+        STATE["limits"][str(target)] = amount
+        save_state()
+    await update.message.reply_text(f"Готово: у {target} теперь лимит {amount} генераций в день.")
+
+@admin_only
+async def unlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/unlimit ID — убрать личный лимит."""
+    try:
+        target = int(context.args[0])
+    except (IndexError, ValueError):
+        await update.message.reply_text("Формат: /unlimit ID")
+        return
+    with STATE_LOCK:
+        removed = STATE["limits"].pop(str(target), None)
+        save_state()
+    if removed is None:
+        await update.message.reply_text(f"У {target} не было личного лимита.")
+    else:
+        await update.message.reply_text(f"Личный лимит у {target} убран.")
+
+@admin_only
+async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/pause ID минуты — запретить генерировать на N минут."""
+    try:
+        target = int(context.args[0])
+        minutes = int(context.args[1])
+        if minutes <= 0 or minutes > 10080:
+            raise ValueError
+    except (IndexError, ValueError):
+        await update.message.reply_text(
+            "Формат: /pause ID минуты (от 1 до 10080)\nНапример: /pause 123456789 30"
+        )
+        return
+    with STATE_LOCK:
+        STATE["pauses"][str(target)] = time.time() + minutes * 60
+        save_state()
+    await update.message.reply_text(f"Готово: {target} не сможет генерировать {minutes} мин.")
+
+@admin_only
+async def unpause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/unpause ID — снять паузу."""
+    try:
+        target = int(context.args[0])
+    except (IndexError, ValueError):
+        await update.message.reply_text("Формат: /unpause ID")
+        return
+    with STATE_LOCK:
+        removed = STATE["pauses"].pop(str(target), None)
+        save_state()
+    if removed is None:
+        await update.message.reply_text(f"У {target} не было паузы.")
+    else:
+        await update.message.reply_text(f"Пауза у {target} снята.")
+
+@admin_only
+async def limits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/limits — список личных лимитов и активных пауз."""
+    now = time.time()
+    with STATE_LOCK:
+        limits = dict(STATE["limits"])
+        pauses = dict(STATE["pauses"])
+
+    default_text = f"{DEFAULT_DAILY_LIMIT} в день" if DEFAULT_DAILY_LIMIT > 0 else "нет"
+    lines = [f"Общий лимит для всех: {default_text}", ""]
+
+    if limits:
+        lines.append("Личные лимиты:")
+        for uid, amount in limits.items():
+            lines.append(f"— {uid}: {amount} в день (сегодня сделано {used_today(int(uid))})")
+    else:
+        lines.append("Личных лимитов нет.")
+
+    active = [(uid, until) for uid, until in pauses.items() if float(until) > now]
+    lines.append("")
+    if active:
+        lines.append("Паузы:")
+        for uid, until in active:
+            lines.append(f"— {uid}: ещё примерно {minutes_text(int(float(until) - now))}")
+    else:
+        lines.append("Активных пауз нет.")
+    await update.message.reply_text("\n".join(lines))
+
+# ---------- Обработка сообщений и кнопок ----------
 
 @allowed_only
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -696,6 +924,7 @@ def main():
     if not BOT_TOKEN:
         raise RuntimeError("Переменная BOT_TOKEN не задана в Environment на Render")
 
+    load_state()
     threading.Thread(target=run_flask, daemon=True).start()
     if KEEP_ALIVE_MIN > 0:
         threading.Thread(target=keep_alive_loop, daemon=True).start()
@@ -710,6 +939,12 @@ def main():
     application.add_handler(CommandHandler(["picture", "photo", "image", "pic"], picture_command))
     application.add_handler(CommandHandler("video", video_command))
     application.add_handler(CommandHandler("models", models_command))
+    application.add_handler(CommandHandler("mylimit", mylimit_command))
+    application.add_handler(CommandHandler("limit", limit_command))
+    application.add_handler(CommandHandler("unlimit", unlimit_command))
+    application.add_handler(CommandHandler("pause", pause_command))
+    application.add_handler(CommandHandler("unpause", unpause_command))
+    application.add_handler(CommandHandler("limits", limits_command))
     application.add_handler(CallbackQueryHandler(choice_callback, pattern=r"^[pv]:\d+$"))
     application.add_handler(CallbackQueryHandler(photo_choice_callback, pattern=r"^[ea]:\d+$"))
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, photo_handler))
