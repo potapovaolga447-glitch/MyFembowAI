@@ -248,7 +248,8 @@ def make_image(prompt: str):
         url = f"{API_BASE}/image/{quote(english, safe='')}"
         for model in IMAGE_MODELS:
             params = {"model": model, "width": 1024, "height": 1024, "seed": seed}
-            data, err = http_get_media(url, params, "image", 90, f"фото:{model}")
+            label = f"фото:{model}"
+            data, err = http_get_media(url, params, "image", 90, label)
             if data:
                 break
             errors.append(f"{model}: {err}")
@@ -308,7 +309,8 @@ def make_edit(prompt: str, photo_bytes: bytes):
     try:
         for model in EDIT_MODELS:
             params = {"model": model, "image": img_url, "seed": seed}
-            data, e = http_get_media(url, params, "image", 120, f"правка:{model}")
+            label = f"правка:{model}"
+            data, e = http_get_media(url, params, "image", 120, label)
             if data:
                 break
             errors.append(f"{model}: {e}")
@@ -334,7 +336,8 @@ def make_video(prompt: str):
     errors = []
     for model in VIDEO_MODELS:
         params = {"model": model, "duration": VIDEO_SECONDS}
-        data, err = http_get_media(url, params, "video", 300, f"видео:{model}")
+        label = f"видео:{model}"
+        data, err = http_get_media(url, params, "video", 300, label)
         if data:
             return data, []
         errors.append(f"{model}: {err}")
@@ -352,4 +355,317 @@ def make_photo_video(prompt: str, photo_bytes: bytes):
     try:
         for model in VIDEO_MODELS:
             params = {"model": model, "image": img_url, "duration": VIDEO_SECONDS}
-            data, e = http_get_media(url, params, "video", 300,
+            label = f"видео из фото:{model}"
+            data, e = http_get_media(url, params, "video", 300, label)
+            if data:
+                return data, []
+            errors.append(f"{model}: {e}")
+    finally:
+        TEMP_FILES.pop(token, None)
+    return None, errors
+
+def format_errors(errors) -> str:
+    if not errors:
+        return "Подробностей нет, смотри логи в Render."
+    lines = [f"— {e}" for e in errors[:6]]
+    return ("Что пошло не так:\n" + "\n".join(lines))[:3500]
+
+def fetch_models_text() -> str:
+    lines = [
+        f"Фото по описанию: {' → '.join(IMAGE_MODELS)}",
+        f"Изменение фото: {' → '.join(EDIT_MODELS)}",
+        f"Видео: {' → '.join(VIDEO_MODELS)}",
+        f"Ключ Pollinations: {'есть' if POLLINATIONS_KEY else 'НЕ задан'}",
+        f"Адрес сервиса: {public_base_url() or 'не найден (нужна переменная PUBLIC_URL)'}",
+        "",
+    ]
+    try:
+        r = requests.get(f"{API_BASE}/image/models", timeout=20)
+        data = r.json()
+        items = data if isinstance(data, list) else (data.get("data", []) if isinstance(data, dict) else [])
+        names = []
+        for it in items:
+            if isinstance(it, str):
+                names.append(it)
+            elif isinstance(it, dict):
+                name = it.get("name") or it.get("id")
+                if name:
+                    names.append(str(name))
+        if names:
+            lines.append("Доступные модели:")
+            lines.append(", ".join(names[:80]))
+        else:
+            lines.append("Список моделей: " + r.text[:400])
+    except Exception as e:
+        lines.append(f"Не удалось получить список моделей: {e}")
+    lines.append("")
+    lines.append("Менять модели можно в Render → Environment: IMAGE_MODELS, EDIT_MODELS, VIDEO_MODELS (через запятую).")
+    return "\n".join(lines)[:3900]
+
+# ---------- Общая логика генерации ----------
+
+async def do_generate(bot, chat_id: int, user_id: int, kind: str, prompt: str = "", file_id: str = None):
+    """kind: photo (по описанию), video (по описанию), edit (правка фото), photovideo (видео из фото)."""
+    prompt = prompt.strip()[:MAX_PROMPT_LEN]
+
+    if user_id in BUSY_USERS:
+        await bot.send_message(chat_id, "Подожди, предыдущий запрос ещё делается.")
+        return
+
+    BUSY_USERS.add(user_id)
+    status = None
+    try:
+        photo_bytes = None
+        if kind in ("edit", "photovideo"):
+            tg_file = await bot.get_file(file_id)
+            photo_bytes = bytes(await tg_file.download_as_bytearray())
+
+        if kind in ("video", "photovideo"):
+            status = await bot.send_message(chat_id, "Делаю видео, это займёт 1-3 минуты...")
+            await bot.send_chat_action(chat_id, "upload_video")
+            if kind == "video":
+                video, errors = await asyncio.to_thread(make_video, prompt)
+            else:
+                video, errors = await asyncio.to_thread(make_photo_video, prompt, photo_bytes)
+            if video:
+                await bot.send_video(
+                    chat_id,
+                    video=InputFile(video, filename="video.mp4"),
+                    caption=prompt[:200] or None,
+                    supports_streaming=True,
+                    read_timeout=120,
+                    write_timeout=120,
+                )
+            else:
+                await bot.send_message(
+                    chat_id,
+                    "Не получилось сделать видео.\n\n" + format_errors(errors)
+                    + "\n\nЕсли в ответе HTTP 402, видео платное: нужен баланс на enter.pollinations.ai.",
+                )
+
+        elif kind == "edit":
+            status = await bot.send_message(chat_id, "Меняю фото, подожди 20-60 секунд...")
+            await bot.send_chat_action(chat_id, "upload_photo")
+            image, errors = await asyncio.to_thread(make_edit, prompt, photo_bytes)
+            if image:
+                await bot.send_photo(chat_id, photo=image, caption=prompt[:200])
+            else:
+                await bot.send_message(
+                    chat_id,
+                    "Не получилось изменить фото.\n\n" + format_errors(errors)
+                    + "\n\nЕсли в ответе HTTP 402, эта модель платная для твоего ключа.",
+                )
+
+        else:
+            status = await bot.send_message(chat_id, "Рисую, подожди 10-30 секунд...")
+            await bot.send_chat_action(chat_id, "upload_photo")
+            image, errors = await asyncio.to_thread(make_image, prompt)
+            if image:
+                await bot.send_photo(chat_id, photo=image, caption=prompt[:200])
+            else:
+                await bot.send_message(chat_id, "Не получилось создать картинку.\n\n" + format_errors(errors))
+    except Exception:
+        log.exception("Ошибка при генерации")
+        await bot.send_message(chat_id, "Что-то пошло не так, попробуй ещё раз.")
+    finally:
+        BUSY_USERS.discard(user_id)
+        if status is not None:
+            try:
+                await status.delete()
+            except Exception:
+                pass
+
+# ---------- Команды бота ----------
+
+async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает ID пользователя. Доступна всем."""
+    if update.message is None or update.effective_user is None:
+        return
+    await update.message.reply_text(f"Твой ID: {update.effective_user.id}")
+
+@allowed_only
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привет! Я делаю фото и видео по описанию.\n\n"
+        "/picture кот в космосе — фото\n"
+        "/video кот бежит по лесу — видео\n\n"
+        "Можно просто написать описание, и я спрошу, что создать.\n"
+        "Или пришли мне своё фото: я изменю его по описанию или сделаю из него видео."
+    )
+
+@allowed_only
+async def picture_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    prompt = " ".join(context.args).strip()
+    if not prompt:
+        await update.message.reply_text("Напиши описание после команды. Например: /picture закат над морем")
+        return
+    await do_generate(context.bot, update.message.chat_id, update.effective_user.id, "photo", prompt)
+
+@allowed_only
+async def video_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    prompt = " ".join(context.args).strip()
+    if not prompt:
+        await update.message.reply_text("Напиши описание после команды. Например: /video кот бежит по лесу")
+        return
+    await do_generate(context.bot, update.message.chat_id, update.effective_user.id, "video", prompt)
+
+@allowed_only
+async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = await asyncio.to_thread(fetch_models_text)
+    await update.message.reply_text(text)
+
+@allowed_only
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Текст без команды: описание для правки фото или вопрос 'фото или видео?'."""
+    prompt = (update.message.text or "").strip()
+    if not prompt:
+        return
+
+    # Если до этого выбрали "Изменить фото" без подписи, этот текст и есть описание правки
+    waiting_file = context.user_data.pop("edit_wait", None)
+    if waiting_file:
+        await do_generate(
+            context.bot, update.message.chat_id, update.effective_user.id,
+            "edit", prompt, file_id=waiting_file,
+        )
+        return
+
+    pending = context.application.bot_data.setdefault("pending", {})
+    msg_id = update.message.message_id
+    pending[(update.message.chat_id, msg_id)] = (update.effective_user.id, prompt)
+    while len(pending) > 200:  # не копим старые запросы бесконечно
+        pending.pop(next(iter(pending)))
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📷 Фото", callback_data=f"p:{msg_id}"),
+        InlineKeyboardButton("🎬 Видео", callback_data=f"v:{msg_id}"),
+    ]])
+    await update.message.reply_text("Что создать: фото или видео?", reply_markup=keyboard)
+
+@allowed_only
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пользователь прислал фото: спрашиваем, что с ним сделать."""
+    msg = update.message
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
+    elif msg.document and (msg.document.mime_type or "").startswith("image/"):
+        file_id = msg.document.file_id
+    else:
+        return
+
+    caption = (msg.caption or "").strip()
+    context.user_data.pop("edit_wait", None)  # новое фото отменяет старое ожидание
+
+    pending = context.application.bot_data.setdefault("pending_photos", {})
+    msg_id = msg.message_id
+    pending[(msg.chat_id, msg_id)] = (update.effective_user.id, file_id, caption)
+    while len(pending) > 200:
+        pending.pop(next(iter(pending)))
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🖼 Изменить фото", callback_data=f"e:{msg_id}"),
+        InlineKeyboardButton("🎬 Видео из фото", callback_data=f"a:{msg_id}"),
+    ]])
+    await msg.reply_text("Что сделать с этим фото?", reply_markup=keyboard)
+
+async def choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки Фото / Видео после текстового описания."""
+    q = update.callback_query
+    if q is None or q.message is None:
+        return
+    if not is_allowed(q.from_user.id):
+        await q.answer("У тебя нет доступа", show_alert=True)
+        return
+
+    kind_code, msg_id = q.data.split(":", 1)
+    pending = context.application.bot_data.get("pending", {})
+    key = (q.message.chat_id, int(msg_id))
+    item = pending.get(key)
+    if item is None:
+        await q.answer("Запрос устарел, отправь описание ещё раз.", show_alert=True)
+        return
+
+    owner_id, prompt = item
+    if q.from_user.id != owner_id:
+        await q.answer("Эти кнопки не для тебя.", show_alert=True)
+        return
+
+    pending.pop(key, None)
+    await q.answer()
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+
+    kind = "video" if kind_code == "v" else "photo"
+    await do_generate(context.bot, q.message.chat_id, q.from_user.id, kind, prompt)
+
+async def photo_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки 'Изменить фото' / 'Видео из фото' после присланного фото."""
+    q = update.callback_query
+    if q is None or q.message is None:
+        return
+    if not is_allowed(q.from_user.id):
+        await q.answer("У тебя нет доступа", show_alert=True)
+        return
+
+    kind_code, msg_id = q.data.split(":", 1)
+    pending = context.application.bot_data.get("pending_photos", {})
+    key = (q.message.chat_id, int(msg_id))
+    item = pending.get(key)
+    if item is None:
+        await q.answer("Фото устарело, отправь его ещё раз.", show_alert=True)
+        return
+
+    owner_id, file_id, caption = item
+    if q.from_user.id != owner_id:
+        await q.answer("Эти кнопки не для тебя.", show_alert=True)
+        return
+
+    pending.pop(key, None)
+    await q.answer()
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+
+    chat_id = q.message.chat_id
+    user_id = q.from_user.id
+
+    if kind_code == "a":
+        # Видео из фото: подпись (если есть) описывает, что должно происходить в кадре
+        await do_generate(context.bot, chat_id, user_id, "photovideo", caption, file_id=file_id)
+        return
+
+    # Изменить фото: нужно описание
+    if caption:
+        await do_generate(context.bot, chat_id, user_id, "edit", caption, file_id=file_id)
+    else:
+        context.user_data["edit_wait"] = file_id
+        await context.bot.send_message(
+            chat_id,
+            "Напиши, что изменить на фото. Например: сделай в стиле аниме",
+        )
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("Переменная BOT_TOKEN не задана в Environment на Render")
+
+    threading.Thread(target=run_flask, daemon=True).start()
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+    # concurrent_updates: пока одному человеку делается видео, бот отвечает остальным
+    application = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("id", my_id))
+    application.add_handler(CommandHandler(["picture", "photo", "image", "pic"], picture_command))
+    application.add_handler(CommandHandler("video", video_command))
+    application.add_handler(CommandHandler("models", models_command))
+    application.add_handler(CallbackQueryHandler(choice_callback, pattern=r"^[pv]:\d+$"))
+    application.add_handler(CallbackQueryHandler(photo_choice_callback, pattern=r"^[ea]:\d+$"))
+    application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, photo_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
