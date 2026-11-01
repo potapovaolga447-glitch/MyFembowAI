@@ -3,6 +3,7 @@ import io
 import sys
 import json
 import time
+import base64
 import random
 import asyncio
 import logging
@@ -33,6 +34,12 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 POLLINATIONS_KEY = os.environ.get("POLLINATIONS_KEY", "").strip()
 API_BASE = "https://gen.pollinations.ai"
 
+# Cloudflare Workers AI: бесплатные фото (около 50-60 штук в день на весь бот)
+CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "").strip()
+CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "").strip()
+CF_MODEL = os.environ.get("CF_MODEL", "@cf/black-forest-labs/flux-1-schnell").strip()
+CF_OK = bool(CF_ACCOUNT_ID and CF_API_TOKEN)
+
 def parse_list(raw, default):
     items = [x.strip() for x in (raw or "").split(",") if x.strip()]
     return items or default
@@ -47,10 +54,10 @@ def int_env(name: str, default: int) -> int:
 RESTART_EVERY_MIN = int_env("RESTART_EVERY_MIN", 20)
 # Самопроверка, чтобы бесплатный Render не засыпал: раз в сколько минут (0 = выключить)
 KEEP_ALIVE_MIN = int_env("KEEP_ALIVE_MIN", 10)
-# Лимит генераций в день для всех (0 = без лимита). Личный лимит админа главнее.
+# Лимит генераций в день для каждого человека (0 = без лимита). Личный лимит админа главнее.
 DEFAULT_DAILY_LIMIT = int_env("DEFAULT_DAILY_LIMIT", 0)
 
-# Модели для фото по описанию (пробуются по очереди). Названия из команды /models.
+# Модели Pollinations для фото (пробуются по очереди, нужен баланс на ключе).
 IMAGE_MODELS = parse_list(os.environ.get("IMAGE_MODELS"), [
     "tongyi-mai/z-image-turbo",
     "black-forest-labs/flux.1-schnell",
@@ -333,7 +340,7 @@ def add_label(image_bytes: bytes) -> bytes:
     img.save(out, format="JPEG", quality=92)
     return out.getvalue()
 
-# ---------- Запросы к Pollinations ----------
+# ---------- Запросы к сервисам ----------
 
 def translate_to_english(text: str) -> str:
     try:
@@ -376,6 +383,41 @@ def http_get_media(url, params, expected_type, timeout, label):
     log.warning("%s: HTTP %s, тип %s, ответ: %s", label, r.status_code, ctype, r.text[:300])
     return None, short_error(r.status_code, r.text)
 
+def fetch_cloudflare_image(english: str):
+    """Фото через Cloudflare Workers AI. Возвращает (байты или None, причина ошибки)."""
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_MODEL}"
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
+    payload = {"prompt": english[:2000], "steps": 4}
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=90)
+    except requests.RequestException as e:
+        log.warning("cloudflare: ошибка запроса: %s", e)
+        return None, f"ошибка сети ({type(e).__name__})"
+
+    try:
+        data = r.json()
+    except ValueError:
+        if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
+            return r.content, ""
+        log.warning("cloudflare: HTTP %s, ответ: %s", r.status_code, r.text[:300])
+        return None, f"HTTP {r.status_code}: {r.text[:120]}"
+
+    if r.status_code == 200 and isinstance(data, dict):
+        result = data.get("result")
+        b64 = result.get("image") if isinstance(result, dict) else None
+        if b64:
+            try:
+                return base64.b64decode(b64), ""
+            except Exception:
+                return None, "не удалось разобрать картинку"
+
+    msg = ""
+    errors = data.get("errors") if isinstance(data, dict) else None
+    if isinstance(errors, list) and errors and isinstance(errors[0], dict):
+        msg = errors[0].get("message", "")
+    log.warning("cloudflare: HTTP %s, ответ: %s", r.status_code, str(data)[:300])
+    return None, f"HTTP {r.status_code}: {msg or str(data)[:120]}"[:200]
+
 def make_image(prompt: str):
     """Фото по описанию с надписью. Возвращает (байты или None, список ошибок)."""
     english = translate_to_english(prompt) + QUALITY_SUFFIX
@@ -383,7 +425,14 @@ def make_image(prompt: str):
     data = None
     errors = []
 
-    if POLLINATIONS_KEY:
+    # 1) Cloudflare: бесплатный дневной лимит
+    if CF_OK:
+        data, err = fetch_cloudflare_image(english)
+        if not data:
+            errors.append(f"cloudflare: {err}")
+
+    # 2) Pollinations по ключу (если на балансе есть кредиты)
+    if not data and POLLINATIONS_KEY:
         url = f"{API_BASE}/image/{quote(english, safe='')}"
         for model in IMAGE_MODELS:
             params = {"model": model, "width": 1024, "height": 1024, "seed": seed}
@@ -392,8 +441,9 @@ def make_image(prompt: str):
             if data:
                 break
             errors.append(f"{model}: {err}")
-    else:
-        # Запасной вариант без ключа: старый бесплатный сервис (одна слабая модель)
+
+    # 3) Последний шанс: старый бесплатный сервис без ключа (слабее, с водяным знаком)
+    if not data:
         url = f"https://image.pollinations.ai/prompt/{quote(english, safe='')}"
         params = {"model": "flux", "width": 1024, "height": 1024, "nologo": "true", "seed": seed}
         data, err = http_get_media(url, params, "image", 90, "фото:legacy")
@@ -514,7 +564,8 @@ def fetch_models_text() -> str:
     ping = f"каждые {KEEP_ALIVE_MIN} мин" if KEEP_ALIVE_MIN > 0 else "выключена"
     default_limit = f"{DEFAULT_DAILY_LIMIT} в день" if DEFAULT_DAILY_LIMIT > 0 else "нет"
     lines = [
-        f"Фото по описанию: {' → '.join(IMAGE_MODELS)}",
+        f"Cloudflare (фото): {'подключён' if CF_OK else 'НЕ подключён'}",
+        f"Pollinations для фото: {' → '.join(IMAGE_MODELS)}",
         f"Изменение фото: {' → '.join(EDIT_MODELS)}",
         f"Видео: {' → '.join(VIDEO_MODELS)}",
         f"Ключ Pollinations: {'есть' if POLLINATIONS_KEY else 'НЕ задан'}",
@@ -537,7 +588,7 @@ def fetch_models_text() -> str:
                 if name:
                     names.append(str(name))
         if names:
-            lines.append("Доступные модели:")
+            lines.append("Доступные модели Pollinations:")
             lines.append(", ".join(names[:80]))
         else:
             lines.append("Список моделей: " + r.text[:400])
