@@ -9,6 +9,8 @@ import logging
 import secrets
 import threading
 import tempfile
+import subprocess
+import re
 from datetime import datetime, timezone
 from functools import wraps, lru_cache
 
@@ -378,6 +380,49 @@ def make_image(prompt: str):
 
 # ---------- Генерация видео и изменение фото ----------
 
+def add_video_label(video_bytes: bytes) -> bytes:
+    """Накладывает фирменную надпись на видео. Если обработка не удалась — выбрасывает ошибку."""
+    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    with tempfile.TemporaryDirectory() as workdir:
+        input_path = os.path.join(workdir, "input.mp4")
+        watermark_path = os.path.join(workdir, "watermark.png")
+        output_path = os.path.join(workdir, "watermarked.mp4")
+        with open(input_path, "wb") as source:
+            source.write(video_bytes)
+
+        probe = subprocess.run(
+            [ffmpeg_path, "-hide_banner", "-i", input_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        metadata = probe.stderr or probe.stdout or ""
+        match = re.search(r"Video:.*?(\\d{2,5})x(\\d{2,5})", metadata, re.DOTALL)
+        if not match:
+            raise RuntimeError("не удалось определить размер видео")
+        width, height = int(match.group(1)), int(match.group(2))
+        watermark = label_layer(width)
+        watermark.save(watermark_path, format="PNG")
+        margin = label_margin(width)
+
+        result = subprocess.run(
+            [
+                ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
+                "-i", input_path, "-i", watermark_path,
+                "-filter_complex",
+                f"[0:v][1:v]overlay=x=main_w-overlay_w-{margin}:y=main_h-overlay_h-{margin}:format=auto[v]",
+                "-map", "[v]", "-map", "0:a?",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart", output_path,
+            ],
+            capture_output=True, text=True, timeout=240,
+        )
+        if result.returncode != 0 or not os.path.isfile(output_path):
+            detail = (result.stderr or "неизвестная ошибка ffmpeg").strip()[-500:]
+            raise RuntimeError(f"не удалось наложить водяной знак: {detail}")
+        with open(output_path, "rb") as rendered:
+            return rendered.read()
+
+
 def _make_huggingface_video(prompt: str, photo_bytes: bytes = None):
     """Видео через публичный Lightricks LTX-2.5 ZeroGPU Space, без платных Inference Providers."""
     if not HF_TOKEN:
@@ -408,7 +453,10 @@ def _make_huggingface_video(prompt: str, photo_bytes: bytes = None):
         if not video_path or not os.path.isfile(str(video_path)):
             return None, ["Hugging Face вернул результат без доступного видеофайла"]
         with open(video_path, "rb") as video_file:
-            return video_file.read(), []
+            raw_video = video_file.read()
+        # Не отправляем оригинал без фирменной надписи: сначала обязательно обрабатываем.
+        watermarked_video = add_video_label(raw_video)
+        return watermarked_video, []
     except Exception as e:
         log.exception("Hugging Face ZeroGPU: ошибка генерации")
         message = str(e).replace(HF_TOKEN, "[скрытый токен]") if HF_TOKEN else str(e)
