@@ -392,7 +392,7 @@ def _make_huggingface_video(prompt: str, photo_bytes: bytes = None):
                 temp_image_path = temp_image.name
             image_input = handle_file(temp_image_path)
 
-        client = Client(HF_SPACE, hf_token=HF_TOKEN, verbose=False)
+        client = Client(HF_SPACE, token=HF_TOKEN, verbose=False)
         # Публичная функция run Space: prompt, image, height, width, duration,
         # seed, decoder, auto length, random seed, prompt enhancement.
         result = client.predict(
