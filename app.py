@@ -396,7 +396,7 @@ def add_video_label(video_bytes: bytes) -> bytes:
             capture_output=True, text=True, timeout=30,
         )
         metadata = probe.stderr or probe.stdout or ""
-        match = re.search(r"Video:.*?(\\d{2,5})x(\\d{2,5})", metadata, re.DOTALL)
+        match = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", metadata, re.DOTALL)
         if not match:
             raise RuntimeError("не удалось определить размер видео")
         width, height = int(match.group(1)), int(match.group(2))
