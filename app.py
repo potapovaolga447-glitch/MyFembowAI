@@ -379,7 +379,7 @@ def make_image(prompt: str):
 # ---------- Генерация видео и изменение фото ----------
 
 def _make_huggingface_video(prompt: str, photo_bytes: bytes = None):
-    """Видео через публичный Lightricks ZeroGPU Space. Не использует платные Inference Providers."""
+    """Видео через публичный Lightricks LTX-2.5 ZeroGPU Space, без платных Inference Providers."""
     if not HF_TOKEN:
         return None, ["не задан HF_TOKEN в Environment Render"]
     prompt = (translate_to_english(prompt) or prompt).strip() + VIDEO_SUFFIX
@@ -393,20 +393,18 @@ def _make_huggingface_video(prompt: str, photo_bytes: bytes = None):
             image_input = handle_file(temp_image_path)
 
         client = Client(HF_SPACE, hf_token=HF_TOKEN, verbose=False)
-        prepared_prompt = client.predict(
-            prompt, image_input, False, api_name="/prepare_prompt"
-        )
-        if isinstance(prepared_prompt, (list, tuple)):
-            prepared_prompt = prepared_prompt[0]
+        # Публичная функция run Space: prompt, image, height, width, duration,
+        # seed, decoder, auto length, random seed, prompt enhancement.
         result = client.predict(
-            str(prepared_prompt or prompt),
-            image_input,
-            512, 512, 1.0, False, 42, True, "conv",
-            api_name="/generate_video",
+            prompt, image_input, 512, 512, 2.0, 42, "conv",
+            False, True, False,
+            api_name="/run",
         )
-        video_path = result[0] if isinstance(result, (list, tuple)) else result
-        if isinstance(video_path, dict):
-            video_path = video_path.get("path") or video_path.get("name")
+        video_result = result[0] if isinstance(result, (list, tuple)) else result
+        if isinstance(video_result, dict):
+            video_path = video_result.get("path") or video_result.get("name")
+        else:
+            video_path = video_result
         if not video_path or not os.path.isfile(str(video_path)):
             return None, ["Hugging Face вернул результат без доступного видеофайла"]
         with open(video_path, "rb") as video_file:
