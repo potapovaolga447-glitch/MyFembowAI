@@ -4,3 +4,4 @@ requests
 pillow
 deep-translator
 matplotlib
+gradio_client
