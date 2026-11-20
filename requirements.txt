@@ -5,3 +5,4 @@ pillow
 deep-translator
 matplotlib
 gradio_client>=1.12.1
+imageio-ffmpeg>=0.5.1
