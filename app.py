@@ -8,10 +8,12 @@ import asyncio
 import logging
 import secrets
 import threading
+import tempfile
 from datetime import datetime, timezone
 from functools import wraps, lru_cache
 
 import requests
+from gradio_client import Client, handle_file
 from PIL import Image, ImageDraw, ImageFont
 from deep_translator import GoogleTranslator
 from flask import Flask, Response, abort
@@ -34,6 +36,10 @@ CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "").strip()
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "").strip()
 CF_MODEL = os.environ.get("CF_MODEL", "@cf/black-forest-labs/flux-1-schnell").strip()
 CF_OK = bool(CF_ACCOUNT_ID and CF_API_TOKEN)
+
+# Hugging Face: бесплатный публичный ZeroGPU Space (без Inference Providers)
+HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+HF_SPACE = os.environ.get("HF_SPACE", "Lightricks/LTX-2.5").strip()
 
 def parse_list(raw, default):
     items = [x.strip() for x in (raw or "").split(",") if x.strip()]
@@ -372,14 +378,59 @@ def make_image(prompt: str):
 
 # ---------- Генерация видео и изменение фото ----------
 
+def _make_huggingface_video(prompt: str, photo_bytes: bytes = None):
+    """Видео через публичный Lightricks ZeroGPU Space. Не использует платные Inference Providers."""
+    if not HF_TOKEN:
+        return None, ["не задан HF_TOKEN в Environment Render"]
+    prompt = (translate_to_english(prompt) or prompt).strip() + VIDEO_SUFFIX
+    temp_image_path = None
+    try:
+        image_input = None
+        if photo_bytes:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_image:
+                temp_image.write(photo_bytes)
+                temp_image_path = temp_image.name
+            image_input = handle_file(temp_image_path)
+
+        client = Client(HF_SPACE, hf_token=HF_TOKEN, verbose=False)
+        prepared_prompt = client.predict(
+            prompt, image_input, False, api_name="/prepare_prompt"
+        )
+        if isinstance(prepared_prompt, (list, tuple)):
+            prepared_prompt = prepared_prompt[0]
+        result = client.predict(
+            str(prepared_prompt or prompt),
+            image_input,
+            512, 512, 1.0, False, 42, True, "conv",
+            api_name="/generate_video",
+        )
+        video_path = result[0] if isinstance(result, (list, tuple)) else result
+        if isinstance(video_path, dict):
+            video_path = video_path.get("path") or video_path.get("name")
+        if not video_path or not os.path.isfile(str(video_path)):
+            return None, ["Hugging Face вернул результат без доступного видеофайла"]
+        with open(video_path, "rb") as video_file:
+            return video_file.read(), []
+    except Exception as e:
+        log.exception("Hugging Face ZeroGPU: ошибка генерации")
+        message = str(e).replace(HF_TOKEN, "[скрытый токен]") if HF_TOKEN else str(e)
+        return None, [f"Hugging Face ZeroGPU: {type(e).__name__}: {message[:220]}"]
+    finally:
+        if temp_image_path:
+            try:
+                os.remove(temp_image_path)
+            except OSError:
+                pass
+
 def make_edit(prompt: str, photo_bytes: bytes):
     return None, ["изменение фото временно отключено: бесплатный сервис ещё не подключён"]
 
 def make_video(prompt: str):
-    return None, ["генерация видео временно отключена: бесплатный сервис ещё не подключён"]
+    return _make_huggingface_video(prompt)
 
 def make_photo_video(prompt: str, photo_bytes: bytes):
-    return None, ["видео из фото временно отключено: бесплатный сервис ещё не подключён"]
+    prompt = prompt or DEFAULT_PHOTO_VIDEO_PROMPT
+    return _make_huggingface_video(prompt, photo_bytes)
 
 def format_errors(errors) -> str:
     if not errors:
@@ -394,8 +445,9 @@ def fetch_models_text() -> str:
     lines = [
         f"Cloudflare Workers AI (фото): {'подключён' if CF_OK else 'НЕ подключён'}",
         "Изменение фото: временно недоступно (бесплатный сервис не подключён)",
-        "Видео по тексту: временно недоступно (бесплатный сервис не подключён)",
-        "Видео из фото: временно недоступно (бесплатный сервис не подключён)",
+        "Hugging Face ZeroGPU (видео): " + ("подключён" if HF_TOKEN else "нужен HF_TOKEN"),
+        "Видео по тексту: Lightricks LTX-2.5 ZeroGPU",
+        "Видео из фото: Lightricks LTX-2.5 ZeroGPU",
         f"Автоперезапуск: {restart}",
         f"Самопроверка: {ping}",
         f"Админов: {len(ADMIN_IDS)}, общий лимит: {default_limit}",
