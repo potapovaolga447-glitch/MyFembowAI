@@ -4,14 +4,12 @@ import sys
 import json
 import time
 import base64
-import random
 import asyncio
 import logging
 import secrets
 import threading
 from datetime import datetime, timezone
 from functools import wraps, lru_cache
-from urllib.parse import quote
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
@@ -31,9 +29,6 @@ log = logging.getLogger("bot")
 # ---------- Настройки (берутся из Environment на Render) ----------
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-POLLINATIONS_KEY = os.environ.get("POLLINATIONS_KEY", "").strip()
-API_BASE = "https://gen.pollinations.ai"
-
 # Cloudflare Workers AI: бесплатные фото (около 50-60 штук в день на весь бот)
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "").strip()
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "").strip()
@@ -56,29 +51,6 @@ RESTART_EVERY_MIN = int_env("RESTART_EVERY_MIN", 20)
 KEEP_ALIVE_MIN = int_env("KEEP_ALIVE_MIN", 10)
 # Лимит генераций в день для каждого человека (0 = без лимита). Личный лимит админа главнее.
 DEFAULT_DAILY_LIMIT = int_env("DEFAULT_DAILY_LIMIT", 0)
-
-# Модели Pollinations для фото (пробуются по очереди, нужен баланс на ключе).
-IMAGE_MODELS = parse_list(os.environ.get("IMAGE_MODELS"), [
-    "tongyi-mai/z-image-turbo",
-    "black-forest-labs/flux.1-schnell",
-    "prunaai/p-image",
-    "zimage",
-])
-
-# Модели для изменения готового фото (пробуются по очереди).
-EDIT_MODELS = parse_list(os.environ.get("EDIT_MODELS"), [
-    "black-forest-labs/flux.2-klein-4b",
-    "prunaai/p-image-edit",
-    "black-forest-labs/flux.1-kontext-pro",
-])
-
-# Модели для видео (платные на Pollinations: нужен баланс на ключе).
-VIDEO_MODELS = parse_list(os.environ.get("VIDEO_MODELS"), [
-    "alibaba/wan-2.2-fast",
-    "prunaai/p-video",
-    "bytedance/seedance-2.0-mini",
-])
-VIDEO_SECONDS = 5
 
 # Белый список: ID через запятую. Если пусто, бот доступен всем.
 def parse_allowed_ids(raw: str):
@@ -195,17 +167,6 @@ def record_use(user_id: int):
 # по секретной одноразовой ссылке на своём сервисе и сразу удаляет после работы.
 # Ссылку на файл из Telegram (в ней есть токен бота) наружу НЕ отдаём.
 
-TEMP_FILES = {}
-TEMP_TTL = 600  # секунд
-
-def register_temp(data: bytes) -> str:
-    now = time.time()
-    for k in [k for k, (_, exp) in TEMP_FILES.items() if exp < now]:
-        TEMP_FILES.pop(k, None)
-    token = secrets.token_urlsafe(16)
-    TEMP_FILES[token] = (data, now + TEMP_TTL)
-    return token
-
 def public_base_url() -> str:
     base = os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or ""
     return base.strip().rstrip("/")
@@ -221,13 +182,6 @@ def index():
 @app.route('/health')
 def health():
     return "OK"
-
-@app.route('/t/<token>.jpg')
-def temp_image(token):
-    item = TEMP_FILES.get(token)
-    if not item or item[1] < time.time():
-        abort(404)
-    return Response(item[0], mimetype="image/jpeg")
 
 def run_flask():
     port = int(os.environ.get("PORT", 5000))
@@ -367,22 +321,6 @@ def short_error(status: int, body: str) -> str:
         msg = (body or "").strip()[:120]
     return f"HTTP {status}: {str(msg)[:140]}"
 
-def http_get_media(url, params, expected_type, timeout, label):
-    """Скачивает файл. Возвращает (байты, '') или (None, причина ошибки)."""
-    headers = {}
-    if POLLINATIONS_KEY and url.startswith(API_BASE):
-        headers["Authorization"] = f"Bearer {POLLINATIONS_KEY}"
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=timeout)
-    except requests.RequestException as e:
-        log.warning("%s: ошибка запроса: %s", label, e)
-        return None, f"ошибка сети ({type(e).__name__})"
-    ctype = r.headers.get("content-type", "")
-    if r.status_code == 200 and ctype.startswith(expected_type):
-        return r.content, ""
-    log.warning("%s: HTTP %s, тип %s, ответ: %s", label, r.status_code, ctype, r.text[:300])
-    return None, short_error(r.status_code, r.text)
-
 def fetch_cloudflare_image(english: str):
     """Фото через Cloudflare Workers AI. Возвращает (байты или None, причина ошибки)."""
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_MODEL}"
@@ -419,139 +357,29 @@ def fetch_cloudflare_image(english: str):
     return None, f"HTTP {r.status_code}: {msg or str(data)[:120]}"[:200]
 
 def make_image(prompt: str):
-    """Фото по описанию с надписью. Возвращает (байты или None, список ошибок)."""
+    """Создаёт фото только через настроенный Cloudflare Workers AI."""
+    if not CF_OK:
+        return None, ["генерация фото отключена: Cloudflare Workers AI не настроен"]
     english = translate_to_english(prompt) + QUALITY_SUFFIX
-    seed = random.randint(1, 10_000_000)
-    data = None
-    errors = []
-
-    # 1) Cloudflare: бесплатный дневной лимит
-    if CF_OK:
-        data, err = fetch_cloudflare_image(english)
-        if not data:
-            errors.append(f"cloudflare: {err}")
-
-    # 2) Pollinations по ключу (если на балансе есть кредиты)
-    if not data and POLLINATIONS_KEY:
-        url = f"{API_BASE}/image/{quote(english, safe='')}"
-        for model in IMAGE_MODELS:
-            params = {"model": model, "width": 1024, "height": 1024, "seed": seed}
-            label = f"фото:{model}"
-            data, err = http_get_media(url, params, "image", 90, label)
-            if data:
-                break
-            errors.append(f"{model}: {err}")
-
-    # 3) Последний шанс: старый бесплатный сервис без ключа (слабее, с водяным знаком)
+    data, err = fetch_cloudflare_image(english)
     if not data:
-        url = f"https://image.pollinations.ai/prompt/{quote(english, safe='')}"
-        params = {"model": "flux", "width": 1024, "height": 1024, "nologo": "true", "seed": seed}
-        data, err = http_get_media(url, params, "image", 90, "фото:legacy")
-        if not data:
-            errors.append(f"legacy: {err}")
-
-    if not data:
-        return None, errors
+        return None, [f"cloudflare: {err}"]
     try:
         return add_label(data), []
     except Exception:
         log.exception("Не удалось добавить надпись")
         return data, []
 
-# ---------- Работа с присланным фото ----------
-
-def prepare_jpeg(photo_bytes: bytes, max_side: int = 1024) -> bytes:
-    img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
-    img.thumbnail((max_side, max_side))
-    out = io.BytesIO()
-    img.save(out, format="JPEG", quality=90)
-    return out.getvalue()
-
-def publish_temp_photo(photo_bytes: bytes):
-    """Выкладывает фото на временную ссылку. Возвращает (ссылка, токен, ошибка)."""
-    if not POLLINATIONS_KEY:
-        return None, None, "нужна переменная POLLINATIONS_KEY в Render"
-    base = public_base_url()
-    if not base:
-        return None, None, (
-            "не знаю адрес сервиса: добавь в Render → Environment переменную PUBLIC_URL "
-            "(адрес твоего сервиса, например https://имя.onrender.com)"
-        )
-    try:
-        jpeg = prepare_jpeg(photo_bytes)
-    except Exception:
-        return None, None, "не удалось прочитать фото"
-    token = register_temp(jpeg)
-    return f"{base}/t/{token}.jpg", token, ""
+# ---------- Генерация видео и изменение фото ----------
 
 def make_edit(prompt: str, photo_bytes: bytes):
-    """Меняет присланное фото по описанию. Возвращает (байты или None, список ошибок)."""
-    img_url, token, err = publish_temp_photo(photo_bytes)
-    if not img_url:
-        return None, [err]
-
-    english = translate_to_english(prompt)
-    seed = random.randint(1, 10_000_000)
-    url = f"{API_BASE}/image/{quote(english, safe='')}"
-    errors = []
-    data = None
-    try:
-        for model in EDIT_MODELS:
-            params = {"model": model, "image": img_url, "seed": seed}
-            label = f"правка:{model}"
-            data, e = http_get_media(url, params, "image", 120, label)
-            if data:
-                break
-            errors.append(f"{model}: {e}")
-    finally:
-        TEMP_FILES.pop(token, None)  # сразу удаляем фото с временной ссылки
-
-    if not data:
-        return None, errors
-    try:
-        return add_label(data), []
-    except Exception:
-        log.exception("Не удалось добавить надпись")
-        return data, []
-
-# ---------- Видео через ИИ (платное: нужен баланс на ключе Pollinations) ----------
+    return None, ["изменение фото временно отключено: бесплатный сервис ещё не подключён"]
 
 def make_video(prompt: str):
-    """Видео по описанию. Возвращает (байты или None, список ошибок)."""
-    if not POLLINATIONS_KEY:
-        return None, ["для видео нужна переменная POLLINATIONS_KEY в Render"]
-    english = translate_to_english(prompt) + VIDEO_SUFFIX
-    url = f"{API_BASE}/video/{quote(english, safe='')}"
-    errors = []
-    for model in VIDEO_MODELS:
-        params = {"model": model, "duration": VIDEO_SECONDS}
-        label = f"видео:{model}"
-        data, err = http_get_media(url, params, "video", 300, label)
-        if data:
-            return data, []
-        errors.append(f"{model}: {err}")
-    return None, errors
+    return None, ["генерация видео временно отключена: бесплатный сервис ещё не подключён"]
 
 def make_photo_video(prompt: str, photo_bytes: bytes):
-    """Видео из присланного фото. Возвращает (байты или None, список ошибок)."""
-    img_url, token, err = publish_temp_photo(photo_bytes)
-    if not img_url:
-        return None, [err]
-
-    english = translate_to_english(prompt or DEFAULT_PHOTO_VIDEO_PROMPT)
-    url = f"{API_BASE}/video/{quote(english, safe='')}"
-    errors = []
-    try:
-        for model in VIDEO_MODELS:
-            params = {"model": model, "image": img_url, "duration": VIDEO_SECONDS}
-            label = f"видео из фото:{model}"
-            data, e = http_get_media(url, params, "video", 300, label)
-            if data:
-                return data, []
-            errors.append(f"{model}: {e}")
-    finally:
-        TEMP_FILES.pop(token, None)
-    return None, errors
+    return None, ["видео из фото временно отключено: бесплатный сервис ещё не подключён"]
 
 def format_errors(errors) -> str:
     if not errors:
@@ -564,38 +392,14 @@ def fetch_models_text() -> str:
     ping = f"каждые {KEEP_ALIVE_MIN} мин" if KEEP_ALIVE_MIN > 0 else "выключена"
     default_limit = f"{DEFAULT_DAILY_LIMIT} в день" if DEFAULT_DAILY_LIMIT > 0 else "нет"
     lines = [
-        f"Cloudflare (фото): {'подключён' if CF_OK else 'НЕ подключён'}",
-        f"Pollinations для фото: {' → '.join(IMAGE_MODELS)}",
-        f"Изменение фото: {' → '.join(EDIT_MODELS)}",
-        f"Видео: {' → '.join(VIDEO_MODELS)}",
-        f"Ключ Pollinations: {'есть' if POLLINATIONS_KEY else 'НЕ задан'}",
-        f"Адрес сервиса: {public_base_url() or 'не найден (нужна переменная PUBLIC_URL)'}",
+        f"Cloudflare Workers AI (фото): {'подключён' if CF_OK else 'НЕ подключён'}",
+        "Изменение фото: временно недоступно (бесплатный сервис не подключён)",
+        "Видео по тексту: временно недоступно (бесплатный сервис не подключён)",
+        "Видео из фото: временно недоступно (бесплатный сервис не подключён)",
         f"Автоперезапуск: {restart}",
         f"Самопроверка: {ping}",
         f"Админов: {len(ADMIN_IDS)}, общий лимит: {default_limit}",
-        "",
     ]
-    try:
-        r = requests.get(f"{API_BASE}/image/models", timeout=20)
-        data = r.json()
-        items = data if isinstance(data, list) else (data.get("data", []) if isinstance(data, dict) else [])
-        names = []
-        for it in items:
-            if isinstance(it, str):
-                names.append(it)
-            elif isinstance(it, dict):
-                name = it.get("name") or it.get("id")
-                if name:
-                    names.append(str(name))
-        if names:
-            lines.append("Доступные модели Pollinations:")
-            lines.append(", ".join(names[:80]))
-        else:
-            lines.append("Список моделей: " + r.text[:400])
-    except Exception as e:
-        lines.append(f"Не удалось получить список моделей: {e}")
-    lines.append("")
-    lines.append("Менять модели можно в Render → Environment: IMAGE_MODELS, EDIT_MODELS, VIDEO_MODELS (через запятую).")
     return "\n".join(lines)[:3900]
 
 # ---------- Общая логика генерации ----------
@@ -643,7 +447,7 @@ async def do_generate(bot, chat_id: int, user_id: int, kind: str, prompt: str = 
                 await bot.send_message(
                     chat_id,
                     "Не получилось сделать видео.\n\n" + format_errors(errors)
-                    + "\n\nЕсли в ответе HTTP 402, видео платное: нужен баланс на enter.pollinations.ai.",
+                    + "\n\nПлатные сервисы не используются.",
                 )
 
         elif kind == "edit":
@@ -657,7 +461,7 @@ async def do_generate(bot, chat_id: int, user_id: int, kind: str, prompt: str = 
                 await bot.send_message(
                     chat_id,
                     "Не получилось изменить фото.\n\n" + format_errors(errors)
-                    + "\n\nЕсли в ответе HTTP 402, эта модель платная для твоего ключа.",
+                    + "\n\nПлатные сервисы не используются.",
                 )
 
         else:
