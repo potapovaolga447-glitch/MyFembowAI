@@ -11,6 +11,7 @@ import threading
 import tempfile
 import subprocess
 import re
+import imageio_ffmpeg
 from datetime import datetime, timezone
 from functools import wraps, lru_cache
 
